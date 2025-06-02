@@ -8,7 +8,8 @@ from collections import Counter
 
 
 def extract_all_colors(image_path, max_colors=200):
-    """提取图片中的所有唯一颜色（限制最大数量）"""
+    """提取图片中的主要颜色（使用K-means聚类）"""
+    # 读取图片
     image = cv2.imread(image_path)
     if image is None:
         return []
@@ -16,14 +17,41 @@ def extract_all_colors(image_path, max_colors=200):
     # 转换为RGB格式
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    # 获取所有像素颜色
-    pixels = image.reshape(-1, 3)
+    # 调整图片大小以加速处理
+    h, w, _ = image.shape
+    if w > 800 or h > 800:
+        scale = 800 / max(w, h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # 获取唯一颜色及其计数
-    color_counter = Counter(map(tuple, pixels))
+    # 重塑图像为像素列表
+    pixel_values = image.reshape((-1, 3))
+    pixel_values = np.float32(pixel_values)
 
-    # 按频率排序并限制最大数量
-    sorted_colors = sorted(color_counter.items(), key=lambda x: x[1], reverse=True)
+    # 使用K-means聚类找到主要颜色
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+    k = min(max_colors, 10)  # 最多提取max_colors种颜色，但至少10种
+
+    _, labels, centers = cv2.kmeans(
+        pixel_values, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS
+    )
+
+    # 转换为整数
+    centers = np.uint8(centers)
+
+    # 获取颜色频率
+    counts = Counter(labels.flatten())
+    total_pixels = len(labels)
+
+    # 按频率排序
+    sorted_colors = sorted(
+        [(centers[i], count) for i, count in counts.items()],
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    # 返回颜色列表（不带频率）
     return [color[0] for color in sorted_colors[:max_colors]]
 
 
@@ -67,6 +95,7 @@ def create_color_grid(colors, cols=8, square_size=50):
             key=f"-COLOR-{i}-",
             tooltip=hex_color,
             pad=(0, 0)
+        )
 
         # 创建文本元素
         text_block = sg.Text(
@@ -76,7 +105,8 @@ def create_color_grid(colors, cols=8, square_size=50):
             text_color=text_color,
             background_color=hex_color,
             pad=(0, 0),
-            key=f"-TEXT-{i}-")
+            key=f"-TEXT-{i}-"
+        )
 
         # 组合颜色块和文本
         color_element = sg.Column([
@@ -89,7 +119,7 @@ def create_color_grid(colors, cols=8, square_size=50):
         # 每行达到指定列数后换行
         if (i + 1) % cols == 0 or i == len(colors) - 1:
             grid.append(row)
-        row = []
+            row = []
 
     return grid
 
@@ -130,7 +160,7 @@ initial_layout = [
     [
         sg.Frame("提取的颜色", [
             [sg.Text("正在等待图片...", key="-COLORGRIDTEXT-", size=(60, 10))],
-            [sg.Column([[]], key="-COLORGRID-", size=(750, 300), scrollable=True, vertical_scroll_only=True)]
+            [sg.Column([[]], key="-COLORGRIDCONTAINER-", size=(750, 300), scrollable=True, vertical_scroll_only=True)]
         ], size=(800, 300), expand_x=True)
     ],
     [sg.StatusBar("准备就绪...", key="-STATUS-", size=(50, 1), expand_x=True)]
@@ -154,6 +184,8 @@ COLOR_NAMES = {
 # 事件循环
 all_colors = []
 current_colors = []
+color_grid_container = window["-COLORGRIDCONTAINER-"]
+
 while True:
     event, values = window.read()
 
@@ -192,14 +224,24 @@ while True:
             # 创建颜色网格
             color_grid_layout = create_color_grid(all_colors, cols=10)
 
-            # 更新颜色网格区域
-            window["-COLORGRID-"].update(visible=False)
-            window["-COLORGRID-"].update(color_grid_layout)
-            window["-COLORGRID-"].update(visible=True)
+            # 更新颜色网格区域 - 修复方法
+            # 创建一个新的列来包含颜色网格
+            new_color_grid = sg.Column(
+                color_grid_layout,
+                key="-COLORGRID-",
+                size=(750, 300),
+                scrollable=True,
+                vertical_scroll_only=True
+            )
+
+            # 替换容器中的内容
+            color_grid_container.update(visible=False)
+            color_grid_container.add_row(new_color_grid)
+            color_grid_container.update(visible=True)
             window["-COLORGRIDTEXT-"].update(visible=False)
 
             # 更新状态
-            window["-STATUS-"].update(f"提取完成！共找到 {len(all_colors)} 种颜色")
+            window["-STATUS-"].update(f"提取完成！共找到 {len(all_colors)} 种主要颜色")
 
             # 重置详情区域
             window["-COLORTEXT-"].update("点击颜色查看详情")
@@ -212,6 +254,9 @@ while True:
 
         except Exception as e:
             sg.popup_error(f"处理图片时出错:\n{str(e)}")
+            import traceback
+
+            traceback.print_exc()
             window["-STATUS-"].update("错误发生！")
 
     # 处理颜色搜索事件
@@ -240,10 +285,18 @@ while True:
         current_colors = matched_colors
         color_grid_layout = create_color_grid(matched_colors, cols=10)
 
-        # 更新颜色网格区域
-        window["-COLORGRID-"].update(visible=False)
-        window["-COLORGRID-"].update(color_grid_layout)
-        window["-COLORGRID-"].update(visible=True)
+        # 更新颜色网格区域 - 修复方法
+        new_color_grid = sg.Column(
+            color_grid_layout,
+            key="-COLORGRID-",
+            size=(750, 300),
+            scrollable=True,
+            vertical_scroll_only=True
+        )
+
+        color_grid_container.update(visible=False)
+        color_grid_container.add_row(new_color_grid)
+        color_grid_container.update(visible=True)
 
         window["-STATUS-"].update(f"找到 {len(matched_colors)} 个匹配的颜色")
 
@@ -253,10 +306,18 @@ while True:
             current_colors = all_colors.copy()
             color_grid_layout = create_color_grid(all_colors, cols=10)
 
-            # 更新颜色网格区域
-            window["-COLORGRID-"].update(visible=False)
-            window["-COLORGRID-"].update(color_grid_layout)
-            window["-COLORGRID-"].update(visible=True)
+            # 更新颜色网格区域 - 修复方法
+            new_color_grid = sg.Column(
+                color_grid_layout,
+                key="-COLORGRID-",
+                size=(750, 300),
+                scrollable=True,
+                vertical_scroll_only=True
+            )
+
+            color_grid_container.update(visible=False)
+            color_grid_container.add_row(new_color_grid)
+            color_grid_container.update(visible=True)
 
             window["-SEARCH-"].update("")
             window["-STATUS-"].update(f"显示所有 {len(all_colors)} 种颜色")
